@@ -1,0 +1,11 @@
+{
+  "name": "pi-l1-cache",
+  "version": "1.0.0",
+  "description": "L1 in-memory cache extension for pi — CPU/RAM optimized",
+  "main": "src/index.ts",
+  "keywords": ["pi", "extension", "cache", "performance"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
