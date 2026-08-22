@@ -28,7 +28,10 @@ pi → [L1: RAM Map] → [L2: Redis via LiteLLM] → Provider
 ## Installation
 
 ```bash
-# From GitHub (recommended)
+# From npm (recommended)
+pi install npm:pi-l1-cache
+
+# From GitHub
 pi install git:github.com/tobias-weiss-ai-xr/pi-l1-cache@main
 
 # From local clone

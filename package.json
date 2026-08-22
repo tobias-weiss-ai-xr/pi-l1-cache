@@ -10,12 +10,18 @@
   "keywords": [
     "pi",
     "pi-coding-agent",
+    "pi-package",
     "extension",
     "cache",
     "performance",
     "L1",
     "memory",
     "caching"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
   ],
   "author": "Tobias Weiß <weissto@hrz.uni-marburg.de>",
   "license": "MIT",
