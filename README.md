@@ -11,10 +11,11 @@ A high-performance, production-ready **L1 (in-memory) cache** extension for the 
 
 | Feature | Description |
 |---------|-------------|
-| **~0.1ms lookup** | FNV-1a fast hash — ~100× faster than SHA256 |
+| **~138µs overhead** | End-to-end per-request cost (measured, incl. key hashing + JSON) |
+| **Fast key hash** | FNV-1a (~1.5µs/op) — no per-request CPU probe on the hot path |
 | **Memory cap** | Hard limit (20MB default) prevents RAM bloat |
 | **Auto-eviction** | LRU-style cleanup when limits reached |
-| **CPU-aware** | Auto-disables when CPU > 95% |
+| **CPU-aware** | Auto-disables when CPU > 95% (checked once at startup) |
 | **TTL-based** | 1-hour default expiry for cached entries |
 | **Atomic cleanup** | Periodic expired entry removal |
 
@@ -22,7 +23,7 @@ A high-performance, production-ready **L1 (in-memory) cache** extension for the 
 
 ```
 pi → [L1: RAM Map] → [L2: Redis via LiteLLM] → Provider
-     <0.5ms          ~150ms                   1-3s
+     ~138µs          ~150ms                   1-3s
 ```
 
 ## Installation
@@ -119,7 +120,7 @@ const DEFAULTS: Settings = {
 - **Zero dependencies** — Single TypeScript file
 
 ### Performance Optimizations
-1. **Fast string hashing** (FNV-1a) instead of SHA256
+1. **Cheap key hashing** (FNV-1a, ~1.5µs/op). Note: Node's native SHA-256 (OpenSSL) is marginally *faster* than a JS FNV loop — hashing is a rounding error next to `JSON.stringify(messages)`, and both are >1000× below provider latency. The real win is *not* a faster hash, it is skipping the provider call.
 2. **L1 only** — avoid disk I/O in hot path
 3. **Batch eviction** — remove 10-20% at a time, not one-by-one
 4. **Periodic cleanup** — async, non-blocking garbage collection
@@ -144,6 +145,22 @@ npx tsc --noEmit
 - LRU eviction behavior (entry count + memory)
 - State management & reset
 - Settings override
+
+## Benchmark
+
+Measured against the published npm artifact (`pi-l1-cache@1.2.1`) on Node 22, using the package's own test hooks and a mocked `ExtensionAPI` with a realistic 15-message conversation history:
+
+| Measurement | Result |
+|---|---|
+| `fastHash` (FNV-1a) standalone | ~670k ops/s — 1.49µs/op |
+| Node native `sha256` (for reference) | ~850k ops/s — 1.18µs/op |
+| Full put: hash + map set + size check | ~249k ops/s — 4.0µs/op |
+| Interceptor path (hit *and* miss, 15-msg history) | ~138µs/request |
+| Cache hit vs uncached provider round-trip (1–3s) | ~7,000–20,000× wall-clock |
+| Key uniqueness over 50k synthetic keys | 50,000/50,000 (no collisions) |
+| Eviction under 200-slot cap, 20k inserts | cap held; 19,800 evicted |
+
+> ⚠ **Correction:** earlier versions claimed FNV-1a was "~100× faster than SHA256". That was wrong — Node's native SHA-256 is ~0.8× *faster* in practice. The hash was never the bottleneck: `JSON.stringify` dominates the ~138µs per-request cost. Cache hits are keyed by *byte-identical* requests, so real-world hit rate depends on your workload (best for retries, repeated tool calls and same-prompt reruns).
 
 ## Related Projects
 

@@ -1,6 +1,6 @@
 {
   "name": "pi-l1-cache",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "L1 in-memory cache extension for pi — CPU/RAM optimized, production-ready",
   "type": "module",
   "main": "./src/index.ts",
