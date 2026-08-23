@@ -4,6 +4,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pi Package](https://img.shields.io/badge/pi-package-blue)](https://pi.dev/packages)
+[![npm version](https://img.shields.io/npm/v/pi-l1-cache)](https://www.npmjs.com/package/pi-l1-cache)
+[![CI](https://github.com/tobias-weiss-ai-xr/pi-l1-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/tobias-weiss-ai-xr/pi-l1-cache/actions/workflows/ci.yml)
 
 A high-performance, production-ready **L1 (in-memory) cache** extension for the [pi coding agent](https://pi.dev). Designed for stoic Unix simplicity: one file, one purpose, zero dependencies.
 
@@ -161,6 +163,15 @@ Measured against the published npm artifact (`pi-l1-cache@1.2.1`) on Node 22, us
 | Eviction under 200-slot cap, 20k inserts | cap held; 19,800 evicted |
 
 > ⚠ **Correction:** earlier versions claimed FNV-1a was "~100× faster than SHA256". That was wrong — Node's native SHA-256 is ~0.8× *faster* in practice. The hash was never the bottleneck: `JSON.stringify` dominates the ~138µs per-request cost. Cache hits are keyed by *byte-identical* requests, so real-world hit rate depends on your workload (best for retries, repeated tool calls and same-prompt reruns).
+
+## pi API compatibility
+
+Verified against the **pi 0.84.x** extension API — two runtime facts shape the behaviour:
+
+- `before_provider_request` receives the assembled provider request as `event.payload` (model, messages, parameters); cache keys are derived from it. In current pi this hook is a payload *transform*, not a response short-circuit, so a cached response is only ever returned once a response body has actually been captured.
+- `after_provider_response` currently carries only `{ status, headers }` — **no response body**. Until a pi version exposes the body, responses cannot be stored; the extension detects this, logs a one-time note, and keeps `/l1-cache` stats working. It upgrades automatically (no config) on any pi version that exposes the body.
+
+On pi 0.84 the extension therefore operates as a request-key instrumentation layer (Hits/Misses/Evictions via `/l1-cache`, CPU guard, TTL bookkeeping) and only short-circuits identical requests when the API contract provides the body it needs.
 
 ## Related Projects
 

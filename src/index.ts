@@ -14,7 +14,14 @@
 //   - CPU-aware graceful degradation
 //   - Zero dependencies, single file
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
+import type {
+  BeforeProviderRequestEvent,
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionEvent,
+} from "@earendil-works/pi-coding-agent"
+
+type AfterProviderResponseEvent = Extract<ExtensionEvent, { type: "after_provider_response" }>
 
 // ---------------------------------------------------------------------------
 // Types
@@ -78,6 +85,12 @@ let initialCpuLoad = 0
 let initialCpuStatus: "ok" | "disabled" | "error" = "ok"
 let lastCleanup = Date.now()
 const stats: Stats = { hits: 0, misses: 0, evictions: 0, cpuSkips: 0 }
+
+// Capability flags (learned at runtime, never assumed):
+// `canServe` turns true only after we capture a real response body, and gates
+// short-circuiting so we never replace the outgoing request payload with garbage.
+let canServe = false
+let bodyWarningShown = false
 
 // ---------------------------------------------------------------------------
 // Core helpers
@@ -231,12 +244,17 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_shutdown", () => clearInterval(cleanupTimer))
 
   // Interceptor: cache lookup before provider request
-  pi.on("before_provider_request", async (event, ctx) => {
+  pi.on("before_provider_request", async (event: BeforeProviderRequestEvent, ctx) => {
     if (!settings.enabled) return
 
     const model = ctx.model?.id || "unknown"
-    const messages = event.messages || []
-    const params = event.parameters || {}
+    // pi passes the assembled provider request as `event.payload`
+    const payload = event.payload as
+      | { messages?: unknown[]; parameters?: unknown }
+      | null
+      | undefined
+    const messages = payload?.messages ?? []
+    const params = payload?.parameters ?? {}
 
     // Fast hash; no per-request CPU check to stay on the hot path
     const key = fastHash(model + JSON.stringify(messages) + JSON.stringify(params))
@@ -244,22 +262,42 @@ export default async function (pi: ExtensionAPI) {
 
     if (entry && Date.now() - entry.timestamp <= settings.ttlSeconds * 1000) {
       stats.hits++
-      return entry.response as never
+      // Only replace the payload when we have actually captured a response body.
+      // Without one (pi 0.84 +) a return value would overwrite the outgoing
+      // request payload instead of short-circuiting — so we count the hit and
+      // leave the request untouched.
+      if (canServe) return entry.response
+      return
     }
 
     // Miss — remember the key for after_provider_response
-    event._cacheKey = key
+    ;(event as unknown as { _cacheKey?: string })._cacheKey = key
     stats.misses++
   })
 
   // Interceptor: store response after provider finishes
-  pi.on("after_provider_response", async (event) => {
+  pi.on("after_provider_response", async (event: AfterProviderResponseEvent) => {
     if (!settings.enabled) return
-    if (!event._cacheKey) return
 
-    const key = event._cacheKey as string
-    const response = event.response ?? event.choices ?? event
+    // pi 0.84 + exposes only { status, headers } here — no response body.
+    // Guard so we never cache the event envelope as if it were a response.
+    const e = event as unknown as { _cacheKey?: string; response?: unknown; choices?: unknown }
+    const response = e.response ?? e.choices
+    if (response === undefined) {
+      if (!bodyWarningShown) {
+        bodyWarningShown = true
+        console.log(
+          "[l1-cache] note: this pi version does not expose a response body in 'after_provider_response'; " +
+            "responses cannot be cached. Stats remain available via /l1-cache.",
+        )
+      }
+      return
+    }
+    if (!e._cacheKey) return
+
+    const key = e._cacheKey
     const size = estimateSize(response)
+    canServe = true
 
     cache.set(key, { response, timestamp: Date.now(), sizeBytes: size })
     totalMemory += size
@@ -269,7 +307,7 @@ export default async function (pi: ExtensionAPI) {
   // Commands
   pi.registerCommand("l1-cache", {
     description: "Show L1 cache stats, or use 'clear' to reset",
-    handler: async (args: string, ctx: ExtensionContext) => {
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
       const arg = (args ?? "").trim()
 
       if (arg === "clear") {
@@ -278,7 +316,7 @@ export default async function (pi: ExtensionAPI) {
         stats.hits = 0
         stats.misses = 0
         stats.evictions = 0
-        ctx.ui.notify("L1 cache cleared", "success")
+        ctx.ui.notify("L1 cache cleared", "info")
         return
       }
 
@@ -287,6 +325,7 @@ export default async function (pi: ExtensionAPI) {
           stats.hits + stats.misses > 0 ? ((stats.hits / (stats.hits + stats.misses)) * 100).toFixed(1) : "0.0"
         const lines = [
           `L1 cache status: ${settings.enabled ? "ENABLED" : "disabled"}`,
+          `Response caching: ${canServe ? "active" : "unavailable (no response body in this pi API)"}`,
           `Entries: ${cache.size} / ${settings.maxEntries}`,
           `Memory: ${(totalMemory / 1024 / 1024).toFixed(1)}MB / ${(settings.maxMemoryBytes / 1024 / 1024).toFixed(1)}MB`,
           `TTL: ${settings.ttlSeconds}s | CPU threshold: ${settings.cpuThreshold}%`,
@@ -296,23 +335,22 @@ export default async function (pi: ExtensionAPI) {
           `Last cleanup: ${new Date(lastCleanup).toISOString()}`,
         ]
         ctx.ui.notify(lines.join("\n"), "info")
-        return ""
+        return
       }
 
       if (arg === "enable") {
         settings.enabled = true
-        ctx.ui.notify("L1 cache enabled", "success")
+        ctx.ui.notify("L1 cache enabled", "info")
         return
       }
 
       if (arg === "disable") {
         settings.enabled = false
-        ctx.ui.notify("L1 cache disabled", "success")
+        ctx.ui.notify("L1 cache disabled", "info")
         return
       }
 
       ctx.ui.notify(`Unknown command: /l1-cache ${arg}\nUsage: /l1-cache [stats|clear|enable|disable]`, "error")
-      return ""
     },
   })
 

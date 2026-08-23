@@ -1,6 +1,6 @@
-import { describe, it, beforeEach } from "node:test"
+import { describe, it, beforeEach, before, after } from "node:test"
 import assert from "node:assert/strict"
-import { _testHooks } from "./index.ts"
+import init, { _testHooks } from "./index.ts"
 
 const Test = _testHooks()
 
@@ -131,6 +131,106 @@ describe("pi-l1-cache", () => {
       const state = Test.getState()
       assert.equal(state.settings.maxEntries, 999)
       assert.equal(state.settings.maxMemoryBytes, 999999)
+    })
+  })
+
+  describe("interceptor flow (extension lifecycle)", () => {
+    type Handler = (ev?: any, ctx?: any) => any
+    const events: Record<string, Handler[]> = {}
+    let shutdown: (() => void) | undefined
+
+    before(async () => {
+      const api: any = {
+        registerCommand: () => {},
+        on: (name: string, cb: Handler) => {
+          ;(events[name] ??= []).push(cb)
+        },
+      }
+      await init(api)
+      const shutdownCbs = events.session_shutdown ?? []
+      shutdown = () => shutdownCbs.forEach((cb) => cb())
+    })
+
+    after(() => {
+      shutdown?.()
+    })
+
+    beforeEach(() => {
+      Test.reset()
+      Test.setSettings({ enabled: true, maxEntries: 50, maxMemoryBytes: 100000, ttlSeconds: 3600 })
+    })
+
+    const payload = () => ({ messages: [{ role: "user", content: "hello cache" }], parameters: {} })
+    const event = (): any => ({ type: "before_provider_request", payload: payload() })
+    const reqCtx = { model: { id: "test-model" } }
+
+    it("records a miss and stamps _cacheKey on first request", async () => {
+      const ev: any = event()
+      const ret = await events.before_provider_request[0](ev, reqCtx)
+      assert.equal(ret, undefined)
+      assert.ok(ev._cacheKey, "should stamp _cacheKey on miss")
+      assert.equal(Test.getStats().misses, 1)
+    })
+
+    it("returns the cached response on a byte-identical repeat when a body is captured", async () => {
+      const first: any = event()
+      await events.before_provider_request[0](first, reqCtx)
+      // Simulate a pi API that exposes the response body
+      await events.after_provider_response[0]({
+        type: "after_provider_response",
+        status: 200,
+        headers: {},
+        _cacheKey: first._cacheKey,
+        response: { content: "cached!" },
+      } as any)
+
+      const second: any = event()
+      const out = await events.before_provider_request[0](second, reqCtx)
+      assert.ok(out, "identical repeat should short-circuit to cache")
+      assert.equal(out.content, "cached!")
+      assert.equal(Test.getStats().hits, 1)
+    })
+
+    it("never stores an event envelope when no response body is available", async () => {
+      const first: any = event()
+      await events.before_provider_request[0](first, reqCtx)
+      // pi 0.84 + shape: status + headers only, no body
+      await events.after_provider_response[0]({
+        type: "after_provider_response",
+        status: 200,
+        headers: {},
+      } as any)
+      assert.equal(Test._getCacheSize(), 0, "must not cache the event envelope")
+      assert.ok(
+        Test.getStats().misses >= 0,
+        "after_provider_response without a body must not poison the cache",
+      )
+    })
+
+    it("does not touch the cache when disabled", async () => {
+      Test.setSettings({ enabled: false })
+      const ev: any = event()
+      const ret = await events.before_provider_request[0](ev, reqCtx)
+      assert.equal(ret, undefined)
+      assert.equal(ev._cacheKey, undefined)
+      assert.equal(Test.getStats().misses, 0)
+    })
+
+    it("keeps size within cap under interceptor churn", async () => {
+      Test.setSettings({ maxEntries: 20 })
+      for (let i = 0; i < 50; i++) {
+        const ev: any = {
+          type: "before_provider_request",
+          payload: { messages: [{ role: "user", content: `q-${i}` }], parameters: {} },
+        }
+        await events.before_provider_request[0](ev, reqCtx)
+        await events.after_provider_response[0]({
+          _cacheKey: ev._cacheKey,
+          response: { content: "a".repeat(50) },
+        } as any)
+      }
+      assert.ok(Test._getCacheSize() <= 20)
+      assert.ok(Test.getStats().misses >= 50)
     })
   })
 })

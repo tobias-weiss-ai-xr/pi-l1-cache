@@ -39,9 +39,18 @@
   },
   "scripts": {
     "test": "node --test src/*.test.ts",
-    "test:watch": "node --watch --test src/*.test.ts"
+    "test:watch": "node --watch --test src/*.test.ts",
+    "typecheck": "tsc",
+    "pack": "npm pack --dry-run",
+    "prepack": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0"
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.8.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
   }
 }

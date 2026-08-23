@@ -5,6 +5,13 @@ node_modules/
 dist/
 build/
 *.js.map
+*.tsbuildinfo
+
+# npm artifacts
+*.tgz
+
+# pi local installs
+.pi/
 
 # IDE
 .idea/
