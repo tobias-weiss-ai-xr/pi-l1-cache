@@ -174,4 +174,4 @@ MIT — see [LICENSE](LICENSE)
 
 ## Maintainer
 
-[Tobias Weiß](https://github.com/tobias-weiss-ai-xr) — weissto@hrz.uni-marburg.de
+[Tobias Weiß](https://github.com/tobias-weiss-ai-xr) — info@graphwiz.ai
