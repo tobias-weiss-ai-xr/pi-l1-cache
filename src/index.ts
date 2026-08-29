@@ -1,34 +1,25 @@
-// L1 Cache Extension — in-memory response cache for pi
-//
-// Stoic Unix principle: One thing, done well.
-// Optimized for minimal CPU/RAM overhead.
+// L1 Cache Extension — response cache for pi (working implementation)
 //
 // Architecture:
-//   pi → [L1: RAM Map] → [L2: Redis via LiteLLM] → Provider
-//   Lookup: ~0.1ms  (vs 150ms Redis, 1-3s API)
+//   pi → [L1: RAM Map + disk (~/.pi/agent/cache/l1-cache)] → Provider
 //
-// Design goals:
-//   - Fast string hash (FNV-1a) — ~100x faster than SHA256
-//   - Hard memory cap — never lets RAM bloat
-//   - TTL + LRU eviction
-//   - CPU-aware graceful degradation
-//   - Zero dependencies, single file
+// How it works (requires the fix-l1-cache.js pi patches):
+//   - "provider_stream_complete" (new event, patched into sdk.js) delivers the
+//     raw OpenAI stream chunks + request params after a successful completion.
+//   - On a cache hit, "before_provider_request" returns the original payload
+//     with a __piL1Replay marker; the patched pi-ai stream() feeds the cached
+//     chunks through the normal consume path and never contacts the provider.
+//
+// Key: stable hash of model + messages + tools + sampling fields.
+// Volatile fields (prompt_cache_key, session ids, stream flags) are excluded.
 
-import type {
-  BeforeProviderRequestEvent,
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionEvent,
-} from "@earendil-works/pi-coding-agent"
-
-type AfterProviderResponseEvent = Extract<ExtensionEvent, { type: "after_provider_response" }>
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import fs from "node:fs"
+import path from "node:path"
+import os from "node:os"
 
 interface CacheEntry {
-  response: unknown
+  chunks: any[]
   timestamp: number
   sizeBytes: number
 }
@@ -38,321 +29,292 @@ interface Settings {
   maxEntries: number
   maxMemoryBytes: number
   ttlSeconds: number
-  cpuThreshold: number
+  persist: boolean
   logStats: boolean
 }
-
-interface Stats {
-  hits: number
-  misses: number
-  evictions: number
-  cpuSkips: number
-}
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
 
 const DEFAULTS: Settings = {
   enabled: true,
   maxEntries: 200,
   maxMemoryBytes: 20 * 1024 * 1024, // 20MB
   ttlSeconds: 3600,
-  cpuThreshold: 95,
+  persist: true,
   logStats: false,
 }
 
-// Users can override via environment variables (highest priority)
-function envSettings(): Partial<Settings> {
-  const out: Partial<Settings> = {}
-  if (process.env.L1_CACHE_ENABLED !== undefined) out.enabled = process.env.L1_CACHE_ENABLED !== "false"
-  if (process.env.L1_CACHE_MAX_ENTRIES) out.maxEntries = parseInt(process.env.L1_CACHE_MAX_ENTRIES, 10) || DEFAULTS.maxEntries
-  if (process.env.L1_CACHE_MAX_MB) out.maxMemoryBytes = (parseInt(process.env.L1_CACHE_MAX_MB, 10) || 20) * 1024 * 1024
-  if (process.env.L1_CACHE_TTL) out.ttlSeconds = parseInt(process.env.L1_CACHE_TTL, 10) || DEFAULTS.ttlSeconds
-  if (process.env.L1_CACHE_LOG) out.logStats = process.env.L1_CACHE_LOG === "true"
-  return out
-}
-
-const settings: Settings = { ...DEFAULTS, ...envSettings() }
-
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
+const CACHE_DIR = path.join(os.homedir(), ".pi", "agent", "cache", "l1-cache")
 
 let cache = new Map<string, CacheEntry>()
 let totalMemory = 0
-let initialCpuLoad = 0
-let initialCpuStatus: "ok" | "disabled" | "error" = "ok"
-let lastCleanup = Date.now()
-const stats: Stats = { hits: 0, misses: 0, evictions: 0, cpuSkips: 0 }
+let stats = { hits: 0, misses: 0, writes: 0, evictions: 0, replays: 0 }
+let settings: Settings = { ...DEFAULTS }
 
-// Capability flags (learned at runtime, never assumed):
-// `canServe` turns true only after we capture a real response body, and gates
-// short-circuiting so we never replace the outgoing request payload with garbage.
-let canServe = false
-let bodyWarningShown = false
+// Guard against re-storing a response we just served from cache.
+let lastServed: { key: string; at: number } | null = null
 
-// ---------------------------------------------------------------------------
-// Core helpers
-// ---------------------------------------------------------------------------
-
-/** Fast string hash (FNV-1a) — ~100x faster than SHA256, enough for cache keys */
-function fastHash(str: string): string {
-  let hash = 2166136261
-  for (let i = 0; i < str.length; i++) {
-    hash ^= str.charCodeAt(i)
-    hash = Math.imul(hash, 16777619)
-  }
-  return hash.toString(16)
-}
-
-/** Estimate in-memory size of an arbitrary object (UTF-16 overhead ×2) */
-function estimateSize(obj: unknown): number {
-  try {
-    const json = JSON.stringify(obj)
-    if (json === undefined) return 64 // undefined/unserializable primitive
-    return json.length * 2
-  } catch {
-    return 1024 // fallback for non-serializable
-  }
-}
-
-function log(...args: unknown[]) {
+function log(...args: any[]) {
   if (settings.logStats) console.log("[l1-cache]", ...args)
 }
 
-// ---------------------------------------------------------------------------
-// Eviction
-// ---------------------------------------------------------------------------
+// FNV-1a — fast, good enough for exact-match keys (collision => 1-in-billions
+// and even then only identical-shape requests after JSON canonicalization).
+function fastHash(str: string): string {
+  let h1 = 2166136261
+  let h2 = 2166136261
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i)
+    h1 = Math.imul(h1 ^ c, 16777619)
+    h2 = Math.imul(h2 ^ (c + i), 16777619)
+  }
+  return (h1 >>> 0).toString(16) + (h2 >>> 0).toString(16)
+}
 
-function evictOldest(count: number) {
-  if (count <= 0) return
-  const sorted = Array.from(cache.entries()).sort((a, b) => a[1].timestamp - b[1].timestamp)
-  for (let i = 0; i < Math.min(count, sorted.length); i++) {
-    const [key, entry] = sorted[i]
-    totalMemory -= entry.sizeBytes
-    cache.delete(key)
-    stats.evictions++
+/**
+ * Stable cache key from the real request payload. Only fields that change the
+ * model's output are included; transport/volatile fields are excluded.
+ */
+function keyForPayload(payload: any): string | null {
+  if (!payload || !Array.isArray(payload.messages)) return null
+  const basis = {
+    model: payload.model,
+    messages: payload.messages,
+    tools: payload.tools,
+    tool_choice: payload.tool_choice,
+    temperature: payload.temperature,
+    top_p: payload.top_p,
+    reasoning_effort: payload.reasoning_effort,
+    thinking: payload.thinking,
+    max_completion_tokens: payload.max_completion_tokens,
+    max_tokens: payload.max_tokens,
+  }
+  return fastHash(JSON.stringify(basis))
+}
+
+function estimateSize(chunks: any[]): number {
+  try {
+    return JSON.stringify(chunks).length * 2
+  } catch {
+    return 4096
   }
 }
 
-/** Enforce size and memory caps using LRU-style (oldest-first) eviction */
+/** Merge adjacent pure-delta chunks (content / reasoning_content) to shrink storage. */
+function coalesceChunks(chunks: any[]): any[] {
+  const COALESCEABLE = new Set(["content", "reasoning_content", "reasoning"])
+  const out: any[] = []
+  for (const chunk of chunks) {
+    const prev = out[out.length - 1]
+    const choice = chunk?.choices?.[0]
+    const prevChoice = prev?.choices?.[0]
+    if (
+      prev &&
+      choice &&
+      prevChoice &&
+      choice.delta &&
+      prevChoice.delta &&
+      !choice.finish_reason &&
+      !prevChoice.finish_reason &&
+      !chunk.usage &&
+      !prev.usage &&
+      !choice.delta.tool_calls &&
+      !prevChoice.delta.tool_calls
+    ) {
+      const dKeys = Object.keys(choice.delta).filter((k) => choice.delta[k] !== undefined)
+      const pKeys = Object.keys(prevChoice.delta).filter((k) => prevChoice.delta[k] !== undefined)
+      // each delta must be a single coalesceable string field (role allowed on the first)
+      const dField = dKeys.find((k) => COALESCEABLE.has(k))
+      const pField = pKeys.find((k) => COALESCEABLE.has(k))
+      const dOk = dKeys.every((k) => k === dField || k === "role") && typeof choice.delta[dField] === "string"
+      const pOk = pKeys.every((k) => k === pField || k === "role") && typeof prevChoice.delta[pField] === "string"
+      if (dOk && pOk && dField === pField) {
+        prevChoice.delta[pField] += choice.delta[dField]
+        continue
+      }
+    }
+    out.push(chunk)
+  }
+  return out
+}
+
 function evictIfNeeded() {
   while (cache.size > settings.maxEntries) {
-    evictOldest(Math.max(1, Math.ceil(settings.maxEntries * 0.1)))
+    const oldest = Array.from(cache.entries()).sort((a, b) => a[1].timestamp - b[1].timestamp)[0]
+    if (!oldest) break
+    totalMemory -= oldest[1].sizeBytes
+    cache.delete(oldest[0])
+    stats.evictions++
+    if (settings.persist) {
+      try {
+        fs.unlinkSync(path.join(CACHE_DIR, oldest[0] + ".json"))
+      } catch {}
+    }
   }
   while (totalMemory > settings.maxMemoryBytes) {
-    evictOldest(Math.max(1, Math.ceil(settings.maxEntries * 0.2)))
-  }
-}
-
-/** Remove expired entries (called periodically + on access) */
-function cleanupExpired() {
-  const now = Date.now()
-  let expired = 0
-  for (const [key, entry] of cache.entries()) {
-    if (now - entry.timestamp > settings.ttlSeconds * 1000) {
-      totalMemory -= entry.sizeBytes
-      cache.delete(key)
-      expired++
+    const oldest = Array.from(cache.entries()).sort((a, b) => a[1].timestamp - b[1].timestamp)[0]
+    if (!oldest) break
+    totalMemory -= oldest[1].sizeBytes
+    cache.delete(oldest[0])
+    stats.evictions++
+    if (settings.persist) {
+      try {
+        fs.unlinkSync(path.join(CACHE_DIR, oldest[0] + ".json"))
+      } catch {}
     }
   }
-  if (expired > 0) log(`expired ${expired} entries`)
-  lastCleanup = now
 }
 
-// ---------------------------------------------------------------------------
-// CPU check (once at startup — not per-request, to avoid overhead)
-// ---------------------------------------------------------------------------
-
-async function checkInitialCpuLoad(): Promise<number> {
+function persistEntry(key: string, entry: CacheEntry) {
   try {
-    const { execSync } = await import("child_process")
-    if (process.platform === "win32") {
-      const out = execSync("wmic cpu get loadpercentage /value", { encoding: "utf8", timeout: 2000 })
-      const match = out.match(/LoadPercentage\s*:\s*(\d+)/)
-      return match ? parseInt(match[1], 10) : 0
+    fs.mkdirSync(CACHE_DIR, { recursive: true })
+    fs.writeFileSync(
+      path.join(CACHE_DIR, key + ".json"),
+      JSON.stringify({ chunks: entry.chunks, timestamp: entry.timestamp })
+    )
+  } catch (err) {
+    log("persist failed:", (err as Error).message)
+  }
+}
+
+function loadPersisted() {
+  if (!settings.persist) return
+  try {
+    if (!fs.existsSync(CACHE_DIR)) return
+    const now = Date.now()
+    for (const file of fs.readdirSync(CACHE_DIR)) {
+      if (!file.endsWith(".json")) continue
+      try {
+        const raw = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, file), "utf8"))
+        if (!Array.isArray(raw.chunks) || raw.chunks.length === 0) {
+          fs.unlinkSync(path.join(CACHE_DIR, file))
+          continue
+        }
+        if (now - (raw.timestamp || 0) > settings.ttlSeconds * 1000) {
+          fs.unlinkSync(path.join(CACHE_DIR, file))
+          continue
+        }
+        const key = file.replace(/\.json$/, "")
+        const sizeBytes = estimateSize(raw.chunks)
+        cache.set(key, { chunks: raw.chunks, timestamp: raw.timestamp || now, sizeBytes })
+        totalMemory += sizeBytes
+      } catch {
+        try {
+          fs.unlinkSync(path.join(CACHE_DIR, file))
+        } catch {}
+      }
     }
-    const out = execSync("cat /proc/loadavg", { encoding: "utf8", timeout: 2000 })
-    const { cpus } = await import("os")
-    const cores = cpus().length
-    const load = parseFloat(out.split(" ")[0])
-    return Math.min(100, (load / cores) * 100)
-  } catch {
-    return 0
+    evictIfNeeded()
+  } catch (err) {
+    log("load failed:", (err as Error).message)
   }
 }
-
-// ---------------------------------------------------------------------------
-// Tests (self-check on load — see also src/index.test.ts)
-// ---------------------------------------------------------------------------
-
-export function _testHooks() {
-  return {
-    fastHash,
-    estimateSize,
-    evictIfNeeded,
-    cleanupExpired,
-    evictOldest,
-    getStats: () => ({ ...stats }),
-    getState: () => ({ size: cache.size, totalMemory, settings: { ...settings } }),
-    reset: () => {
-      cache = new Map()
-      totalMemory = 0
-      stats.hits = 0
-      stats.misses = 0
-      stats.evictions = 0
-      stats.cpuSkips = 0
-    },
-    _setCache: (key: string, entry: CacheEntry) => {
-      cache.set(key, entry)
-      totalMemory += entry.sizeBytes
-    },
-    _getCacheSize: () => cache.size,
-    _getTotalMemory: () => totalMemory,
-    setSettings: (patch: Partial<Settings>) => Object.assign(settings, patch),
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Main plugin
-// ---------------------------------------------------------------------------
 
 export default async function (pi: ExtensionAPI) {
-  // Async init: check CPU once at startup
-  try {
-    initialCpuLoad = await checkInitialCpuLoad()
-    if (initialCpuLoad > settings.cpuThreshold) {
-      settings.enabled = false
-      initialCpuStatus = "disabled"
-      console.log(
-        `[l1-cache] disabled (CPU ${initialCpuLoad.toFixed(0)}% > ${settings.cpuThreshold}% threshold)`,
-      )
-    } else {
-      initialCpuStatus = "ok"
-      console.log(
-        `[l1-cache] enabled (max ${settings.maxEntries} entries, ${(settings.maxMemoryBytes / 1024 / 1024).toFixed(0)}MB, TTL ${settings.ttlSeconds}s)`,
-      )
-    }
-  } catch (err) {
-    initialCpuStatus = "error"
-    console.log(`[l1-cache] CPU check failed (${err}); continuing enabled`)
+  if (settings.enabled) {
+    console.log(
+      "[l1-cache] enabled (max",
+      settings.maxEntries,
+      "entries,",
+      (settings.maxMemoryBytes / 1024 / 1024).toFixed(0) + "MB, TTL",
+      settings.ttlSeconds + "s,",
+      settings.persist ? "persisted)" : "memory-only)"
+    )
+    loadPersisted()
+    if (cache.size > 0) log("loaded", cache.size, "entries from disk")
+  } else {
+    console.log("[l1-cache] disabled")
   }
 
-  // Periodic cleanup (every 10 minutes)
-  const cleanupTimer = setInterval(cleanupExpired, 10 * 60 * 1000)
+  const cleanupTimer = setInterval(() => {
+    const now = Date.now()
+    for (const [key, entry] of cache.entries()) {
+      if (now - entry.timestamp > settings.ttlSeconds * 1000) {
+        totalMemory -= entry.sizeBytes
+        cache.delete(key)
+        if (settings.persist) {
+          try {
+            fs.unlinkSync(path.join(CACHE_DIR, key + ".json"))
+          } catch {}
+        }
+      }
+    }
+  }, 10 * 60 * 1000)
   pi.on("session_shutdown", () => clearInterval(cleanupTimer))
 
-  // Interceptor: cache lookup before provider request
-  pi.on("before_provider_request", async (event: BeforeProviderRequestEvent, ctx) => {
+  // HIT path: serve cached chunks by replaying them through the patched
+  // pi-ai stream() — the provider is never contacted.
+  pi.on("before_provider_request", async (event: any, ctx) => {
     if (!settings.enabled) return
 
-    const model = ctx.model?.id || "unknown"
-    // pi passes the assembled provider request as `event.payload`
-    const payload = event.payload as
-      | { messages?: unknown[]; parameters?: unknown }
-      | null
-      | undefined
-    const messages = payload?.messages ?? []
-    const params = payload?.parameters ?? {}
+    // The runner can be stale if a provider stream outlives a session
+    // replacement; skip instead of crashing on ctx access.
+    try {
+      if (ctx.model?.id === undefined && event.payload?.model === undefined) return
+    } catch {
+      return
+    }
 
-    // Fast hash; no per-request CPU check to stay on the hot path
-    const key = fastHash(model + JSON.stringify(messages) + JSON.stringify(params))
+    const payload = event.payload
+    const key = keyForPayload(payload)
+    if (!key) return
+
     const entry = cache.get(key)
-
     if (entry && Date.now() - entry.timestamp <= settings.ttlSeconds * 1000) {
       stats.hits++
-      // Only replace the payload when we have actually captured a response body.
-      // Without one (pi 0.84 +) a return value would overwrite the outgoing
-      // request payload instead of short-circuiting — so we count the hit and
-      // leave the request untouched.
-      if (canServe) return entry.response
-      return
+      stats.replays++
+      lastServed = { key, at: Date.now() }
+      entry.timestamp = Date.now() // LRU touch
+      log("HIT", key, "(" + entry.chunks.length + " chunks)")
+      return { ...payload, __piL1Replay: entry.chunks }
     }
 
-    // Miss — remember the key for after_provider_response
-    ;(event as unknown as { _cacheKey?: string })._cacheKey = key
     stats.misses++
+    log("MISS", key)
   })
 
-  // Interceptor: store response after provider finishes
-  pi.on("after_provider_response", async (event: AfterProviderResponseEvent) => {
+  // WRITE path: patched sdk.js emits this after a successful completion with
+  // the raw stream chunks + the exact request params.
+  ;(pi as any).on("provider_stream_complete", async (event: any) => {
     if (!settings.enabled) return
+    const payload = event.payload
+    const key = keyForPayload(payload)
+    if (!key || !Array.isArray(event.chunks) || event.chunks.length === 0) return
 
-    // pi 0.84 + exposes only { status, headers } here — no response body.
-    // Guard so we never cache the event envelope as if it were a response.
-    const e = event as unknown as { _cacheKey?: string; response?: unknown; choices?: unknown }
-    const response = e.response ?? e.choices
-    if (response === undefined) {
-      if (!bodyWarningShown) {
-        bodyWarningShown = true
-        console.log(
-          "[l1-cache] note: this pi version does not expose a response body in 'after_provider_response'; " +
-            "responses cannot be cached. Stats remain available via /l1-cache.",
-        )
-      }
-      return
-    }
-    if (!e._cacheKey) return
+    // Don't re-store what we just replayed from cache.
+    if (lastServed && lastServed.key === key && Date.now() - lastServed.at < 10000) return
 
-    const key = e._cacheKey
-    const size = estimateSize(response)
-    canServe = true
+    const chunks = coalesceChunks(event.chunks)
+    const sizeBytes = estimateSize(chunks)
+    if (sizeBytes > settings.maxMemoryBytes / 4) return // don't cache giant single entries
 
-    cache.set(key, { response, timestamp: Date.now(), sizeBytes: size })
-    totalMemory += size
+    if (cache.has(key)) totalMemory -= cache.get(key)!.sizeBytes
+    cache.set(key, { chunks, timestamp: Date.now(), sizeBytes })
+    totalMemory += sizeBytes
+    stats.writes++
     evictIfNeeded()
+    if (settings.persist) persistEntry(key, cache.get(key)!)
+    log("STORED", key, chunks.length, "chunks,", (sizeBytes / 1024).toFixed(1) + "KB")
   })
 
-  // Commands
+  // Commands for inspection
   pi.registerCommand("l1-cache", {
-    description: "Show L1 cache stats, or use 'clear' to reset",
-    handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const arg = (args ?? "").trim()
-
-      if (arg === "clear") {
+    description: "L1 cache stats and management",
+    handler: async (args: string, ctx: any) => {
+      if (args === "clear") {
         cache.clear()
         totalMemory = 0
-        stats.hits = 0
-        stats.misses = 0
-        stats.evictions = 0
-        ctx.ui.notify("L1 cache cleared", "info")
+        lastServed = null
+        try {
+          if (fs.existsSync(CACHE_DIR))
+            for (const f of fs.readdirSync(CACHE_DIR)) fs.unlinkSync(path.join(CACHE_DIR, f))
+        } catch {}
+        ctx.ui.notify("L1 cache cleared (memory + disk)", "success")
         return
       }
-
-      if (arg === "stats" || arg === "") {
-        const hitRate =
-          stats.hits + stats.misses > 0 ? ((stats.hits / (stats.hits + stats.misses)) * 100).toFixed(1) : "0.0"
-        const lines = [
-          `L1 cache status: ${settings.enabled ? "ENABLED" : "disabled"}`,
-          `Response caching: ${canServe ? "active" : "unavailable (no response body in this pi API)"}`,
-          `Entries: ${cache.size} / ${settings.maxEntries}`,
-          `Memory: ${(totalMemory / 1024 / 1024).toFixed(1)}MB / ${(settings.maxMemoryBytes / 1024 / 1024).toFixed(1)}MB`,
-          `TTL: ${settings.ttlSeconds}s | CPU threshold: ${settings.cpuThreshold}%`,
-          `Hits: ${stats.hits} | Misses: ${stats.misses} | Evictions: ${stats.evictions}`,
-          `Hit rate: ${hitRate}%`,
-          `Init CPU: ${initialCpuLoad.toFixed(1)}% (${initialCpuStatus})`,
-          `Last cleanup: ${new Date(lastCleanup).toISOString()}`,
-        ]
-        ctx.ui.notify(lines.join("\n"), "info")
-        return
-      }
-
-      if (arg === "enable") {
-        settings.enabled = true
-        ctx.ui.notify("L1 cache enabled", "info")
-        return
-      }
-
-      if (arg === "disable") {
-        settings.enabled = false
-        ctx.ui.notify("L1 cache disabled", "info")
-        return
-      }
-
-      ctx.ui.notify(`Unknown command: /l1-cache ${arg}\nUsage: /l1-cache [stats|clear|enable|disable]`, "error")
+      const kb = (totalMemory / 1024).toFixed(1)
+      ctx.ui.notify(
+        `L1 cache: ${cache.size} entries, ${kb}KB | hits ${stats.hits} (replays ${stats.replays}), misses ${stats.misses}, writes ${stats.writes}, evictions ${stats.evictions} | dir: ${CACHE_DIR}`,
+        "info"
+      )
     },
   })
-
-  console.log("[l1-cache] ready. /l1-cache for stats.")
 }

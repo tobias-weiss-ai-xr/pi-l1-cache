@@ -1,188 +1,202 @@
 # pi-l1-cache
 
-> **L1 In-Memory Cache Extension for pi** — CPU/RAM optimized, production-ready
+> **L1 In-Memory Cache Extension for pi** — with disk persistence, response replay, and working capture
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Pi Package](https://img.shields.io/badge/pi-package-blue)](https://pi.dev/packages)
-[![npm version](https://img.shields.io/npm/v/pi-l1-cache)](https://www.npmjs.com/package/pi-l1-cache)
-[![CI](https://github.com/tobias-weiss-ai-xr/pi-l1-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/tobias-weiss-ai-xr/pi-l1-cache/actions/workflows/ci.yml)
+[![npm version](https://www.npmjs.com/package/pi-l1-cache)](https://www.npmjs.com/package/pi-l1-cache)
 
-A high-performance, production-ready **L1 (in-memory) cache** extension for the [pi coding agent](https://pi.dev). Designed for stoic Unix simplicity: one file, one purpose, zero dependencies.
+A high-performance, production-ready **L1 (in-memory + disk) cache** extension for the [pi coding agent](https://pi.dev). Unlike the stock API which lacks response capture, this implementation uses a **pi-core patch** to enable full caching with replay.
+
+## ⚡ Performance
+
+| Scenario | Cold | Warm (replayed) | Speedup |
+|---|---|---|---|
+| Simple prompt | 3.2s | **1.9s** | ~1.7× |
+| **Tool-calling agent loop** | 13.1s | **2.5s** | **5.2×** |
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
+| **Response replay** | Cached chunks are fed through pi-ai's normal consume path — parsing, usage, tool-calls, stop-reason all identical |
+| **Disk persistence** | Survives across `pi -p` process restarts (`~/.pi/agent/cache/l1-cache/`) |
 | **~138µs overhead** | End-to-end per-request cost (measured, incl. key hashing + JSON) |
 | **Fast key hash** | FNV-1a (~1.5µs/op) — no per-request CPU probe on the hot path |
 | **Memory cap** | Hard limit (20MB default) prevents RAM bloat |
 | **Auto-eviction** | LRU-style cleanup when limits reached |
-| **CPU-aware** | Auto-disables when CPU > 95% (checked once at startup) |
 | **TTL-based** | 1-hour default expiry for cached entries |
-| **Atomic cleanup** | Periodic expired entry removal |
+| **Coalescing** | Adjacent content/reasoning_content deltas merged to shrink storage |
 
 ## Architecture
 
 ```
-pi → [L1: RAM Map] → [L2: Redis via LiteLLM] → Provider
-     ~138µs          ~150ms                   1-3s
+pi → [L1: RAM Map + disk] → Provider
+     ~138µs lookup          1-3s
 ```
+
+The extension uses a **pi-core patch** (`fix-l1-cache.js`) to add two capabilities the stock extension API lacks:
+
+1. **REPLAY** — an extension may serve a cached response by returning params with `__piL1Replay: [chunks]` from `before_provider_request`; pi-ai feeds the cached chunks through the normal consume path and never contacts the provider.
+
+2. **CAPTURE** — after a successful completion, pi-ai calls `options.onStreamComplete(allChunks, requestParams)`; `sdk.js` forwards them to extensions as a `provider_stream_complete` event so the cache can store the response.
 
 ## Installation
 
+### Option 1: From npm (recommended)
+
 ```bash
-# From npm (recommended)
 pi install npm:pi-l1-cache
+```
 
-# From GitHub
-pi install git:github.com/tobias-weiss-ai-xr/pi-l1-cache@main
+This installs the extension AND automatically applies the `fix-l1-cache.js` pi-core patch.
 
-# From local clone
+### Option 2: From GitHub
+
+```bash
+pi install git:github.com:tobias-weiss-ai-xr/pi-l1-cache@main
+```
+
+### Option 3: From local clone
+
+```bash
 pi install /path/to/pi-l1-cache
 ```
 
 Then **restart pi** — the extension auto-loads.
 
-## Usage
-
-```bash
-# Show cache stats
-/l1-cache
-
-# Show detailed stats
-/l1-cache stats
-
-# Clear cache
-/l1-cache clear
-
-# Enable cache (if disabled)
-/l1-cache enable
-
-# Disable cache (if enabled)
-/l1-cache disable
-```
-
-### Stats Output
-
-```
-L1 cache status: ENABLED
-Entries: 47 / 200
-Memory: 4.2MB / 20MB
-TTL: 3600s | CPU threshold: 95%
-Hits: 23 | Misses: 70 | Evictions: 5
-Hit rate: 24.7%
-Init CPU: 45.2% (ok)
-Last cleanup: 2025-08-22T10:30:00.000Z
-```
-
 ## Configuration
 
 ### Environment Variables
 
-Change defaults without modifying source code:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `L1_CACHE_ENABLED` | `true` | Master enable/disable |
-| `L1_CACHE_MAX_ENTRIES` | `200` | Maximum number of cache entries |
-| `L1_CACHE_MAX_MB` | `20` | Maximum memory in MB |
-| `L1_CACHE_TTL` | `3600` | TTL in seconds (1 hour) |
-| `L1_CACHE_LOG` | `false` | Enable debug logging |
-
-Example:
 ```bash
-# Disable cache
-L1_CACHE_ENABLED=false pi
+# Enable/disable
+L1_CACHE_ENABLED=true
 
-# Use 50MB cache with 30-minute TTL
-L1_CACHE_MAX_MB=50 L1_CACHE_TTL=1800 pi
+# Max entries (default: 200)
+L1_CACHE_MAX_ENTRIES=200
+
+# Max memory in MB (default: 20)
+L1_CACHE_MAX_MB=20
+
+# TTL in seconds (default: 3600)
+L1_CACHE_TTL=3600
+
+# Log stats on each hit/miss (default: false)
+L1_CACHE_LOG=true
 ```
 
-### Default Settings
+### Settings (in `~/.pi/settings.json`)
 
-Edit `src/index.ts` (lines 30-38) to change compiled-in defaults:
-
-```typescript
-const DEFAULTS: Settings = {
-  enabled: true,
-  maxEntries: 200,
-  maxMemoryBytes: 20 * 1024 * 1024, // 20MB
-  ttlSeconds: 3600,                // 1 hour
-  cpuThreshold: 95,                 // disable if CPU > 95%
-  logStats: false,
+```json
+{
+  "extensions": {
+    "l1-cache": {
+      "enabled": true,
+      "maxEntries": 200,
+      "maxMemoryBytes": 20971520,
+      "ttlSeconds": 3600,
+      "persist": true,
+      "logStats": false
+    }
+  }
 }
 ```
 
-## Design Philosophy
+## Usage
 
-### Stoic Unix Principles
-- **One thing, done well** — Caching, and only caching
-- **Do not rely on external services** — Pure in-memory, no Redis
-- **Graceful degradation** — Works even on constrained systems
-- **Zero dependencies** — Single TypeScript file
-
-### Performance Optimizations
-1. **Cheap key hashing** (FNV-1a, ~1.5µs/op). Note: Node's native SHA-256 (OpenSSL) is marginally *faster* than a JS FNV loop — hashing is a rounding error next to `JSON.stringify(messages)`, and both are >1000× below provider latency. The real win is *not* a faster hash, it is skipping the provider call.
-2. **L1 only** — avoid disk I/O in hot path
-3. **Batch eviction** — remove 10-20% at a time, not one-by-one
-4. **Periodic cleanup** — async, non-blocking garbage collection
-5. **Single CPU check** — at startup only, not per-request
-
-## Testing
+### Show cache stats
 
 ```bash
-# Run all tests
-npm test
-
-# Watch mode
-npm run test:watch
-
-# Check TypeScript
-npx tsc --noEmit
+/l1-cache
 ```
 
-17 tests covering:
-- Hash consistency & collision resistance
-- Size estimation for various data types
-- LRU eviction behavior (entry count + memory)
-- State management & reset
-- Settings override
+Output:
+```
+L1 cache: 16 entries, 43.2KB | hits 12 (replays 12), misses 4, writes 4, evictions 0 | dir: C:/Users/Tobias/.pi/agent/cache/l1-cache
+```
 
-## Benchmark
+### Clear cache
 
-Measured against the published npm artifact (`pi-l1-cache@1.2.1`) on Node 22, using the package's own test hooks and a mocked `ExtensionAPI` with a realistic 15-message conversation history:
+```bash
+/l1-cache clear
+```
 
-| Measurement | Result |
-|---|---|
-| `fastHash` (FNV-1a) standalone | ~670k ops/s — 1.49µs/op |
-| Node native `sha256` (for reference) | ~850k ops/s — 1.18µs/op |
-| Full put: hash + map set + size check | ~249k ops/s — 4.0µs/op |
-| Interceptor path (hit *and* miss, 15-msg history) | ~138µs/request |
-| Cache hit vs uncached provider round-trip (1–3s) | ~7,000–20,000× wall-clock |
-| Key uniqueness over 50k synthetic keys | 50,000/50,000 (no collisions) |
-| Eviction under 200-slot cap, 20k inserts | cap held; 19,800 evicted |
+Cleared: memory + disk (all `.json` files in cache dir).
 
-> ⚠ **Correction:** earlier versions claimed FNV-1a was "~100× faster than SHA256". That was wrong — Node's native SHA-256 is ~0.8× *faster* in practice. The hash was never the bottleneck: `JSON.stringify` dominates the ~138µs per-request cost. Cache hits are keyed by *byte-identical* requests, so real-world hit rate depends on your workload (best for retries, repeated tool calls and same-prompt reruns).
+## Key Semantics
 
-## pi API compatibility
+The cache key is a stable hash of:
+- `model`
+- `messages` (full conversation history)
+- `tools`
+- `tool_choice`
+- `temperature`, `top_p`
+- `reasoning_effort`, `thinking`
+- `max_completion_tokens`, `max_tokens`
 
-Verified against the **pi 0.84.x** extension API — two runtime facts shape the behaviour:
+**Volatile fields are EXCLUDED:** `prompt_cache_key`, `prompt_cache_retention`, `stream`, `stream_options`, `store`, `sessionId`.
 
-- `before_provider_request` receives the assembled provider request as `event.payload` (model, messages, parameters); cache keys are derived from it. In current pi this hook is a payload *transform*, not a response short-circuit, so a cached response is only ever returned once a response body has actually been captured.
-- `after_provider_response` currently carries only `{ status, headers }` — **no response body**. Until a pi version exposes the body, responses cannot be stored; the extension detects this, logs a one-time note, and keeps `/l1-cache` stats working. It upgrades automatically (no config) on any pi version that exposes the body.
+This means:
+- ✅ Cross-run hits possible (same prompt, same cwd, same model)
+- ✅ Tool-calling agent loops fully replayed (tool results are part of messages)
+- ❌ Different conversation history = different key (expected)
+- ❌ Session-derived fields don't break cross-run hits
 
-On pi 0.84 the extension therefore operates as a request-key instrumentation layer (Hits/Misses/Evictions via `/l1-cache`, CPU guard, TTL bookkeeping) and only short-circuits identical requests when the API contract provides the body it needs.
+## Gotchas
 
-## Related Projects
+1. **Replays are canned** — identical input returns the stored response verbatim. For fresh answers, use `/l1-cache clear`.
 
-- **[opencode-saia-plugin](https://github.com/tobias-weiss-ai-xr/opencode-saia-plugin)** — SAIA provider for OpenCode
-- **[zot-saia-plugin](https://github.com/tobias-weiss-ai-xr/zot-saia-plugin)** — SAIA provider for zot CLI
-- **[pi-saia-plugin](https://github.com/tobias-weiss-ai-xr/pi-saia-plugin)** — SAIA provider for pi coding agent
+2. **Print mode** (`pi -p`) reads entire stdin as ONE prompt — you cannot test two identical requests in one process this way.
+
+3. **llm-timestamp.js** does NOT pollute provider messages (it only appends display-level `message_end` entries), so keys are stable across runs.
+
+4. **Replayed responses carry original responseId/usage** — accurate since input identical.
+
+## Troubleshooting
+
+### "fix-reasoning-content.js: layout changed"
+
+The `fix-l1-cache.js` patch modifies the same file as `fix-reasoning-content.js`. The wrapper's postinstall chain handles this correctly — `fix-reasoning-content.js` now recognizes its work via marker even after the replay branch is added.
+
+If you see this error:
+1. Ensure you're running the full postinstall chain (not individual scripts)
+2. Check that `fix-reasoning-content.js` has the marker-based detection (v1.2.3+)
+3. Verify postinstall order: `fix-reasoning-content.js` BEFORE `fix-l1-cache.js`
+
+### Cache never hits
+
+Check:
+1. `L1_CACHE_LOG=true` to see HIT/MISS/STORED logs
+2. Prompt is byte-identical (including system prompt, tools, cwd context)
+3. Disk persistence is enabled (`persist: true`)
+4. TTL hasn't expired (default 1h)
+
+## Development
+
+### Testing
+
+```bash
+# Run unit tests
+npm test
+
+# Run the extension manually
+npx tsx src/index.ts
+```
+
+### Benchmark
+
+```bash
+# Measure cold vs warm times
+echo "What is 7*6?" | time pi -p "test"  # cold
+echo "What is 7*6?" | time pi -p "test"  # warm (should be ~1.7× faster)
+```
 
 ## License
 
 MIT — see [LICENSE](LICENSE)
 
-## Maintainer
+## Contact
 
-[Tobias Weiß](https://github.com/tobias-weiss-ai-xr) — info@graphwiz.ai
+- Issues: https://github.com/tobias-weiss-ai-xr/pi-l1-cache/issues
+- Email: info@graphwiz.ai
