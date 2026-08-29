@@ -42,6 +42,7 @@
   "scripts": {
     "test": "tsx --test src/*.test.ts",
     "test:watch": "tsx --watch --test src/*.test.ts",
+    "typecheck": "tsc --noEmit --skipLibCheck",
     "pack": "npm pack --dry-run"
   },
   "devDependencies": {
