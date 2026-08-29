@@ -42,12 +42,27 @@ const DEFAULTS: Settings = {
   logStats: false,
 }
 
-const CACHE_DIR = path.join(os.homedir(), ".pi", "agent", "cache", "l1-cache")
+/** Cache directory (overridable via L1_CACHE_DIR env for tests) */
+function cacheDir(): string {
+  return process.env.L1_CACHE_DIR || path.join(os.homedir(), ".pi", "agent", "cache", "l1-cache")
+}
+
+/** Users can override via environment variables (highest priority) */
+function envSettings(): Partial<Settings> {
+  const out: Partial<Settings> = {}
+  if (process.env.L1_CACHE_ENABLED !== undefined) out.enabled = process.env.L1_CACHE_ENABLED !== "false"
+  if (process.env.L1_CACHE_MAX_ENTRIES) out.maxEntries = parseInt(process.env.L1_CACHE_MAX_ENTRIES, 10) || DEFAULTS.maxEntries
+  if (process.env.L1_CACHE_MAX_MB) out.maxMemoryBytes = (parseInt(process.env.L1_CACHE_MAX_MB, 10) || 20) * 1024 * 1024
+  if (process.env.L1_CACHE_TTL) out.ttlSeconds = parseInt(process.env.L1_CACHE_TTL, 10) || DEFAULTS.ttlSeconds
+  if (process.env.L1_CACHE_PERSIST !== undefined) out.persist = process.env.L1_CACHE_PERSIST !== "false"
+  if (process.env.L1_CACHE_LOG) out.logStats = process.env.L1_CACHE_LOG === "true"
+  return out
+}
 
 let cache = new Map<string, CacheEntry>()
 let totalMemory = 0
 let stats = { hits: 0, misses: 0, writes: 0, evictions: 0, replays: 0 }
-let settings: Settings = { ...DEFAULTS }
+let settings: Settings = { ...DEFAULTS, ...envSettings() }
 
 // Guard against re-storing a response we just served from cache.
 let lastServed: { key: string; at: number } | null = null
@@ -90,9 +105,11 @@ function keyForPayload(payload: any): string | null {
   return fastHash(JSON.stringify(basis))
 }
 
-function estimateSize(chunks: any[]): number {
+function estimateSize(value: unknown): number {
   try {
-    return JSON.stringify(chunks).length * 2
+    const json = JSON.stringify(value)
+    if (json === undefined) return 4096
+    return json.length * 2
   } catch {
     return 4096
   }
@@ -124,6 +141,10 @@ function coalesceChunks(chunks: any[]): any[] {
       // each delta must be a single coalesceable string field (role allowed on the first)
       const dField = dKeys.find((k) => COALESCEABLE.has(k))
       const pField = pKeys.find((k) => COALESCEABLE.has(k))
+      if (dField === undefined || pField === undefined) {
+        out.push(chunk)
+        continue
+      }
       const dOk = dKeys.every((k) => k === dField || k === "role") && typeof choice.delta[dField] === "string"
       const pOk = pKeys.every((k) => k === pField || k === "role") && typeof prevChoice.delta[pField] === "string"
       if (dOk && pOk && dField === pField) {
@@ -145,7 +166,7 @@ function evictIfNeeded() {
     stats.evictions++
     if (settings.persist) {
       try {
-        fs.unlinkSync(path.join(CACHE_DIR, oldest[0] + ".json"))
+        fs.unlinkSync(path.join(cacheDir(), oldest[0] + ".json"))
       } catch {}
     }
   }
@@ -157,7 +178,7 @@ function evictIfNeeded() {
     stats.evictions++
     if (settings.persist) {
       try {
-        fs.unlinkSync(path.join(CACHE_DIR, oldest[0] + ".json"))
+        fs.unlinkSync(path.join(cacheDir(), oldest[0] + ".json"))
       } catch {}
     }
   }
@@ -165,9 +186,9 @@ function evictIfNeeded() {
 
 function persistEntry(key: string, entry: CacheEntry) {
   try {
-    fs.mkdirSync(CACHE_DIR, { recursive: true })
+    fs.mkdirSync(cacheDir(), { recursive: true })
     fs.writeFileSync(
-      path.join(CACHE_DIR, key + ".json"),
+      path.join(cacheDir(), key + ".json"),
       JSON.stringify({ chunks: entry.chunks, timestamp: entry.timestamp })
     )
   } catch (err) {
@@ -178,18 +199,18 @@ function persistEntry(key: string, entry: CacheEntry) {
 function loadPersisted() {
   if (!settings.persist) return
   try {
-    if (!fs.existsSync(CACHE_DIR)) return
+    if (!fs.existsSync(cacheDir())) return
     const now = Date.now()
-    for (const file of fs.readdirSync(CACHE_DIR)) {
+    for (const file of fs.readdirSync(cacheDir())) {
       if (!file.endsWith(".json")) continue
       try {
-        const raw = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, file), "utf8"))
+        const raw = JSON.parse(fs.readFileSync(path.join(cacheDir(), file), "utf8"))
         if (!Array.isArray(raw.chunks) || raw.chunks.length === 0) {
-          fs.unlinkSync(path.join(CACHE_DIR, file))
+          fs.unlinkSync(path.join(cacheDir(), file))
           continue
         }
         if (now - (raw.timestamp || 0) > settings.ttlSeconds * 1000) {
-          fs.unlinkSync(path.join(CACHE_DIR, file))
+          fs.unlinkSync(path.join(cacheDir(), file))
           continue
         }
         const key = file.replace(/\.json$/, "")
@@ -198,7 +219,7 @@ function loadPersisted() {
         totalMemory += sizeBytes
       } catch {
         try {
-          fs.unlinkSync(path.join(CACHE_DIR, file))
+          fs.unlinkSync(path.join(cacheDir(), file))
         } catch {}
       }
     }
@@ -206,6 +227,20 @@ function loadPersisted() {
   } catch (err) {
     log("load failed:", (err as Error).message)
   }
+}
+
+/** Remove expired entries (called periodically + on access) */
+function cleanupExpired() {
+  const now = Date.now()
+  let expired = 0
+  for (const [key, entry] of cache.entries()) {
+    if (now - entry.timestamp > settings.ttlSeconds * 1000) {
+      totalMemory -= entry.sizeBytes
+      cache.delete(key)
+      expired++
+    }
+  }
+  if (expired > 0) log(`expired ${expired} entries`)
 }
 
 export default async function (pi: ExtensionAPI) {
@@ -232,12 +267,13 @@ export default async function (pi: ExtensionAPI) {
         cache.delete(key)
         if (settings.persist) {
           try {
-            fs.unlinkSync(path.join(CACHE_DIR, key + ".json"))
+            fs.unlinkSync(path.join(cacheDir(), key + ".json"))
           } catch {}
         }
       }
     }
   }, 10 * 60 * 1000)
+  if (typeof cleanupTimer.unref === "function") cleanupTimer.unref()
   pi.on("session_shutdown", () => clearInterval(cleanupTimer))
 
   // HIT path: serve cached chunks by replaying them through the patched
@@ -304,17 +340,36 @@ export default async function (pi: ExtensionAPI) {
         totalMemory = 0
         lastServed = null
         try {
-          if (fs.existsSync(CACHE_DIR))
-            for (const f of fs.readdirSync(CACHE_DIR)) fs.unlinkSync(path.join(CACHE_DIR, f))
+          if (fs.existsSync(cacheDir()))
+            for (const f of fs.readdirSync(cacheDir())) fs.unlinkSync(path.join(cacheDir(), f))
         } catch {}
         ctx.ui.notify("L1 cache cleared (memory + disk)", "success")
         return
       }
       const kb = (totalMemory / 1024).toFixed(1)
       ctx.ui.notify(
-        `L1 cache: ${cache.size} entries, ${kb}KB | hits ${stats.hits} (replays ${stats.replays}), misses ${stats.misses}, writes ${stats.writes}, evictions ${stats.evictions} | dir: ${CACHE_DIR}`,
+        `L1 cache: ${cache.size} entries, ${kb}KB | hits ${stats.hits} (replays ${stats.replays}), misses ${stats.misses}, writes ${stats.writes}, evictions ${stats.evictions} | dir: ${cacheDir()}`,
         "info"
       )
     },
   })
 }
+
+/** Reset all module state (for tests) */
+export function resetForTests() {
+  cache.clear()
+  totalMemory = 0
+  lastServed = null
+  stats.hits = 0
+  stats.misses = 0
+  stats.writes = 0
+  stats.evictions = 0
+  stats.replays = 0
+  Object.assign(settings, DEFAULTS, envSettings())
+}
+
+// Export internal state for testing
+export { cache, totalMemory, stats, settings, cacheDir, lastServed }
+
+// Export internal functions for testing
+export { fastHash, estimateSize, coalesceChunks, evictIfNeeded, cleanupExpired, keyForPayload, persistEntry, loadPersisted }

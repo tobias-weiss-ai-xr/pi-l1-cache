@@ -1,236 +1,514 @@
-import { describe, it, beforeEach, before, after } from "node:test"
-import assert from "node:assert/strict"
-import init, { _testHooks } from "./index.ts"
+// L1 Cache Extension — Test Suite
+//
+// Tests for the working implementation with replay, disk persistence,
+// and proper key semantics.
 
-const Test = _testHooks()
+import { describe, it, beforeEach, afterEach } from "node:test"
+import * as assert from "node:assert"
+import fs from "node:fs"
+import path from "node:path"
+import os from "node:os"
+import { fileURLToPath } from "node:url"
 
-describe("pi-l1-cache", () => {
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+import l1CacheExtension from "./index.js"
+import { cache, stats, settings, fastHash, estimateSize, coalesceChunks, evictIfNeeded, cleanupExpired, keyForPayload, persistEntry, loadPersisted, resetForTests } from "./index.js"
+
+// Test cache directory (isolated from real cache)
+const TEST_CACHE_DIR = path.join(os.tmpdir(), "l1-cache-test-" + Date.now())
+
+// Mock ExtensionAPI
+function createMockExtensionAPI(): any {
+  const handlers = new Map<string, Array<(event: any, ctx?: any) => Promise<any>>>()
+  const commands = new Map<string, any>()
+  let sessionShutdownHandler: ((event: any, ctx?: any) => Promise<any>) | null = null
+
+  return {
+    on: (event: string, handler: (event: any, ctx?: any) => Promise<any>) => {
+      if (event === "session_shutdown") {
+        sessionShutdownHandler = handler
+      } else {
+        if (!handlers.has(event)) handlers.set(event, [])
+        handlers.get(event)!.push(handler)
+      }
+    },
+    registerCommand: (name: string, config: any) => {
+      commands.set(name, config)
+    },
+    emit: async (event: any) => {
+      const eventHandlers = handlers.get(event.type) || []
+      for (const handler of eventHandlers) {
+        await handler(event, {})
+      }
+    },
+    _getHandlers: (event: string) => handlers.get(event) || [],
+    _getSessionShutdownHandler: () => sessionShutdownHandler,
+    _getCommands: () => commands,
+  }
+}
+
+describe("L1 Cache", () => {
+  beforeEach(() => {
+    // Clean test cache directory
+    if (fs.existsSync(TEST_CACHE_DIR)) {
+      fs.rmSync(TEST_CACHE_DIR, { recursive: true, force: true })
+    }
+    fs.mkdirSync(TEST_CACHE_DIR, { recursive: true })
+    // Isolate: redirect persistence + reset all module state
+    process.env.L1_CACHE_DIR = TEST_CACHE_DIR
+    resetForTests()
+  })
+
+  afterEach(() => {
+    // Cleanup test cache directory
+    if (fs.existsSync(TEST_CACHE_DIR)) {
+      fs.rmSync(TEST_CACHE_DIR, { recursive: true, force: true })
+    }
+  })
+
   describe("fastHash", () => {
-    it("returns consistent hash for same input", () => {
-      const input = "test-string-123"
-      assert.equal(Test.fastHash(input), Test.fastHash(input))
+    it("produces consistent hashes for identical strings", () => {
+      const str = "test string"
+      const h1 = fastHash(str)
+      const h2 = fastHash(str)
+      assert.strictEqual(h1, h2)
     })
 
-    it("returns different hash for different input", () => {
-      assert.notEqual(Test.fastHash("hello"), Test.fastHash("world"))
+    it("produces different hashes for different strings", () => {
+      const h1 = fastHash("string1")
+      const h2 = fastHash("string2")
+      assert.notStrictEqual(h1, h2)
     })
 
     it("handles empty string", () => {
-      const empty = Test.fastHash("")
-      assert.ok(empty.length > 0)
+      const hash = fastHash("")
+      assert.ok(hash.length > 0)
     })
 
-    it("handles unicode", () => {
-      const emoji = Test.fastHash("🎉 pi-l1-cache 🎉")
-      assert.ok(emoji.length > 0)
+    it("handles unicode characters", () => {
+      const hash = fastHash("🚀 test")
+      assert.ok(hash.length > 0)
+    })
+  })
+
+  describe("keyForPayload", () => {
+    it("creates key from model and messages", () => {
+      const payload = {
+        model: "local/deepseek-v4",
+        messages: [{ role: "user", content: "test" }],
+      }
+      const key = keyForPayload(payload)
+      assert.ok(key)
+      assert.ok(key.length > 0)
     })
 
-    it("is deterministic", () => {
-      const obj = JSON.stringify({ a: 1, b: 2 })
-      assert.equal(Test.fastHash(obj), Test.fastHash(obj))
+    it("excludes volatile fields from key", () => {
+      const payload1 = {
+        model: "local/deepseek-v4",
+        messages: [{ role: "user", content: "test" }],
+        prompt_cache_key: "session-123",
+        stream: true,
+      }
+      const payload2 = {
+        model: "local/deepseek-v4",
+        messages: [{ role: "user", content: "test" }],
+        prompt_cache_key: "session-456", // different
+        stream: false, // different
+      }
+      const key1 = keyForPayload(payload1)
+      const key2 = keyForPayload(payload2)
+      assert.strictEqual(key1, key2) // keys should match despite volatile differences
+    })
+
+    it("includes tools in key", () => {
+      const payload1 = {
+        model: "local/deepseek-v4",
+        messages: [{ role: "user", content: "test" }],
+        tools: [{ name: "tool1" }],
+      }
+      const payload2 = {
+        model: "local/deepseek-v4",
+        messages: [{ role: "user", content: "test" }],
+        tools: [{ name: "tool2" }], // different
+      }
+      const key1 = keyForPayload(payload1)
+      const key2 = keyForPayload(payload2)
+      assert.notStrictEqual(key1, key2)
+    })
+
+    it("returns null for invalid payloads", () => {
+      assert.strictEqual(keyForPayload(null), null)
+      assert.strictEqual(keyForPayload(undefined), null)
+      assert.strictEqual(keyForPayload({}), null)
+      assert.strictEqual(keyForPayload({ messages: "not-array" }), null)
+    })
+  })
+
+  describe("coalesceChunks", () => {
+    it("merges adjacent content deltas", () => {
+      const chunks = [
+        { choices: [{ delta: { content: "hello" } }] },
+        { choices: [{ delta: { content: " " } }] },
+        { choices: [{ delta: { content: "world" } }] },
+      ]
+      const coalesced = coalesceChunks(chunks)
+      assert.strictEqual(coalesced.length, 1)
+      assert.strictEqual(coalesced[0].choices[0].delta.content, "hello world")
+    })
+
+    it("merges adjacent reasoning_content deltas", () => {
+      const chunks = [
+        { choices: [{ delta: { reasoning_content: "thinking" } }] },
+        { choices: [{ delta: { reasoning_content: " more" } }] },
+      ]
+      const coalesced = coalesceChunks(chunks)
+      assert.strictEqual(coalesced.length, 1)
+      assert.strictEqual(coalesced[0].choices[0].delta.reasoning_content, "thinking more")
+    })
+
+    it("does not merge chunks with finish_reason", () => {
+      const chunks = [
+        { choices: [{ delta: { content: "hello" } }] },
+        { choices: [{ delta: { content: "world" }, finish_reason: "stop" }] },
+      ]
+      const coalesced = coalesceChunks(chunks)
+      assert.strictEqual(coalesced.length, 2)
+    })
+
+    it("does not merge chunks with tool_calls", () => {
+      const chunks = [
+        { choices: [{ delta: { content: "hello" } }] },
+        { choices: [{ delta: { tool_calls: [{ id: "call1" }] } }] },
+      ]
+      const coalesced = coalesceChunks(chunks)
+      assert.strictEqual(coalesced.length, 2)
+    })
+
+    it("handles empty chunks array", () => {
+      const coalesced = coalesceChunks([])
+      assert.strictEqual(coalesced.length, 0)
     })
   })
 
   describe("estimateSize", () => {
-    it("estimates size of simple strings", () => {
-      const size = Test.estimateSize("hello world")
-      assert.ok(size > 0)
-      assert.ok(size < 100)
-    })
-
-    it("estimates size of objects", () => {
-      const obj = { a: 1, b: "test", c: [1, 2, 3] }
-      const size = Test.estimateSize(obj)
+    it("estimates size for simple objects", () => {
+      const obj = { text: "hello" }
+      const size = estimateSize(obj)
       assert.ok(size > 0)
     })
 
-    it("estimates size of arrays", () => {
-      const arr = new Array(100).fill("x")
-      const size = Test.estimateSize(arr)
-      assert.ok(size > 100)
+    it("handles large objects", () => {
+      const obj = { text: "x".repeat(10000) }
+      const size = estimateSize(obj)
+      assert.ok(size > 10000)
     })
 
-    it("returns fallback for non-serializable", () => {
-      const circular: any = { a: 1 }
-      circular.self = circular
-      const size = Test.estimateSize(circular)
-      assert.equal(size, 1024)
-    })
-
-    it("handles null and undefined", () => {
-      assert.ok(Test.estimateSize(null) > 0)
-      assert.ok(Test.estimateSize(undefined) > 0)
+    it("handles undefined", () => {
+      const size = estimateSize(undefined)
+      assert.strictEqual(size, 4096) // fallback for non-serializable
     })
   })
 
-  describe("eviction logic", () => {
-    beforeEach(() => {
-      Test.reset()
-      Test.setSettings({ maxEntries: 10, maxMemoryBytes: 10000 })
+  describe("cache operations", () => {
+    it("stores and retrieves entries", async () => {
+      const payload = {
+        model: "local/deepseek-v4",
+        messages: [{ role: "user", content: "test" }],
+      }
+      const key = keyForPayload(payload)!
+      const chunks = [{ choices: [{ delta: { content: "answer" } }] }]
+      const size = estimateSize(chunks)
+
+      cache.set(key, { chunks, timestamp: Date.now(), sizeBytes: size })
+      evictIfNeeded()
+
+      const entry = cache.get(key)
+      assert.ok(entry)
+      assert.strictEqual(entry!.chunks.length, 1)
     })
 
-    it("evicts oldest entries first", () => {
-      for (let i = 0; i < 15; i++) {
-        Test._setCache(`key-${i}`, { response: {}, timestamp: i * 1000, sizeBytes: 100 })
+    it("evicts oldest entries when over memory cap", async () => {
+      settings.maxEntries = 2
+      settings.maxMemoryBytes = 100
+      const chunks = [{ choices: [{ delta: { content: "x".repeat(50) } }] }]
+      const size = estimateSize(chunks)
+
+      // Store 3 entries (should evict to stay within cap)
+      for (let i = 0; i < 3; i++) {
+        const payload = { model: "local/deepseek-v4", messages: [{ role: "user", content: `test${i}` }] }
+        const key = keyForPayload(payload)!
+        cache.set(key, { chunks, timestamp: Date.now() + i, sizeBytes: size })
+        evictIfNeeded()
       }
-      Test.evictIfNeeded()
-      assert.ok(Test._getCacheSize() <= 10)
+
+      assert.ok(cache.size <= 2)
     })
 
-    it("evicts by memory when full", () => {
-      Test.setSettings({ maxEntries: 1000, maxMemoryBytes: 1000 })
-      Test.reset()
-      for (let i = 0; i < 5; i++) {
-        Test._setCache(`key-${i}`, { response: new Array(100).fill("x"), timestamp: Date.now(), sizeBytes: 200 })
-      }
-      Test.evictIfNeeded()
-      assert.ok(Test._getTotalMemory() > 0)
-      assert.ok(Test._getTotalMemory() <= 1500)
-    })
+    it("respects TTL expiry", async () => {
+      settings.ttlSeconds = 1
+      const payload = { model: "local/deepseek-v4", messages: [{ role: "user", content: "test" }] }
+      const key = keyForPayload(payload)!
+      const chunks = [{ choices: [{ delta: { content: "answer" } }] }]
 
-    it("evictIfNeeded enforces limits", () => {
-      for (let i = 0; i < 20; i++) {
-        Test._setCache(`key-${i}`, { response: {}, timestamp: i, sizeBytes: 100 })
-      }
-      Test.evictIfNeeded()
-      const after = Test._getCacheSize()
-      assert.ok(after <= 10)
-    })
+      // Set timestamp in past (expired)
+      cache.set(key, { chunks, timestamp: Date.now() - 2000, sizeBytes: estimateSize(chunks) })
 
-    it("evictOldest removes specified count", () => {
-      for (let i = 0; i < 10; i++) {
-        Test._setCache(`key-${i}`, { response: {}, timestamp: i * 1000, sizeBytes: 100 })
-      }
-      Test.evictOldest(3)
-      assert.equal(Test._getCacheSize(), 7)
+      // Simulate cleanup
+      cleanupExpired()
+
+      assert.strictEqual(cache.has(key), false)
     })
   })
 
-  describe("state management", () => {
-    beforeEach(() => {
-      Test.reset()
-      Test.setSettings({ maxEntries: 100, maxMemoryBytes: 1000000, ttlSeconds: 3600 })
+  describe("persistence", () => {
+    it("persists entries to disk", async () => {
+      const payload = { model: "local/deepseek-v4", messages: [{ role: "user", content: "test" }] }
+      const key = keyForPayload(payload)!
+      const chunks = [{ choices: [{ delta: { content: "answer" } }] }]
+
+      persistEntry(key, { chunks, timestamp: Date.now(), sizeBytes: estimateSize(chunks) })
+
+      // Verify file exists
+      const filePath = path.join(TEST_CACHE_DIR, key + ".json")
+      assert.ok(fs.existsSync(filePath))
+
+      // Load and verify
+      cache.clear()
+      loadPersisted()
+      assert.strictEqual(cache.size, 1)
     })
 
-    it("returns correct state after adding entries", () => {
-      Test._setCache("k1", { response: {}, timestamp: Date.now(), sizeBytes: 100 })
-      Test._setCache("k2", { response: {}, timestamp: Date.now(), sizeBytes: 100 })
-      assert.equal(Test._getCacheSize(), 2)
-      assert.ok(Test._getTotalMemory() > 0)
+    it("ignores expired entries on load", async () => {
+      settings.ttlSeconds = 1
+      const payload = { model: "local/deepseek-v4", messages: [{ role: "user", content: "test" }] }
+      const key = keyForPayload(payload)!
+
+      // Persist with old timestamp
+      persistEntry(key, {
+        chunks: [{ choices: [{ delta: { content: "answer" } }] }],
+        timestamp: Date.now() - 2000,
+        sizeBytes: estimateSize([]),
+      })
+
+      cache.clear()
+      loadPersisted()
+      assert.strictEqual(cache.size, 0)
     })
 
-    it("reset clears all state", () => {
-      Test._setCache("k1", { response: {}, timestamp: Date.now(), sizeBytes: 100 })
-      Test.reset()
-      assert.equal(Test._getCacheSize(), 0)
-      assert.equal(Test._getTotalMemory(), 0)
-    })
+    it("handles corrupted files gracefully", async () => {
+      // Create corrupted file
+      fs.writeFileSync(path.join(TEST_CACHE_DIR, "corrupt.json"), "not valid json")
 
-    it("setSettings works", () => {
-      Test.setSettings({ maxEntries: 999, maxMemoryBytes: 999999 })
-      const state = Test.getState()
-      assert.equal(state.settings.maxEntries, 999)
-      assert.equal(state.settings.maxMemoryBytes, 999999)
+      cache.clear()
+      loadPersisted()
+      // Should not crash, corrupted file should be deleted
+      assert.strictEqual(fs.existsSync(path.join(TEST_CACHE_DIR, "corrupt.json")), false)
     })
   })
 
-  describe("interceptor flow (extension lifecycle)", () => {
-    type Handler = (ev?: any, ctx?: any) => any
-    const events: Record<string, Handler[]> = {}
-    let shutdown: (() => void) | undefined
+  describe("extension integration", () => {
+    it("initializes and registers commands", async () => {
+      const mockApi = createMockExtensionAPI()
+      await l1CacheExtension(mockApi)
 
-    before(async () => {
-      const api: any = {
-        registerCommand: () => {},
-        on: (name: string, cb: Handler) => {
-          ;(events[name] ??= []).push(cb)
+      const commands = mockApi._getCommands()
+      assert.ok(commands.has("l1-cache"))
+    })
+
+    it("handles before_provider_request (miss)", async () => {
+      const mockApi = createMockExtensionAPI()
+      await l1CacheExtension(mockApi)
+
+      const handler = mockApi._getHandlers("before_provider_request")[0]
+      const event = {
+        payload: { model: "local/deepseek-v4", messages: [{ role: "user", content: "test" }] },
+      }
+
+      const result = await handler(event, { model: { id: "local/deepseek-v4" } })
+      assert.strictEqual(result, undefined) // miss, no replay
+    })
+
+    it("handles before_provider_request (hit)", async () => {
+      const mockApi = createMockExtensionAPI()
+      await l1CacheExtension(mockApi)
+
+      const handler = mockApi._getHandlers("before_provider_request")[0]
+      const payload = { model: "local/deepseek-v4", messages: [{ role: "user", content: "test" }] }
+      const event = { payload }
+
+      // First call is miss
+      await handler(event, { model: { id: "local/deepseek-v4" } })
+
+      // Simulate a cache entry
+      const key = keyForPayload(payload)!
+      cache.set(key, {
+        chunks: [{ choices: [{ delta: { content: "cached" } }] }],
+        timestamp: Date.now(),
+        sizeBytes: 100,
+      })
+
+      // Second call should hit
+      const result = await handler(event, { model: { id: "local/deepseek-v4" } })
+      assert.ok(result)
+      assert.ok((result as any).__piL1Replay)
+    })
+
+    it("handles provider_stream_complete", async () => {
+      const mockApi = createMockExtensionAPI()
+      await l1CacheExtension(mockApi)
+
+      const handler = mockApi._getHandlers("provider_stream_complete")[0]
+      const event = {
+        payload: { model: "local/deepseek-v4", messages: [{ role: "user", content: "test" }] },
+        chunks: [{ choices: [{ delta: { content: "answer" } }] }],
+      }
+
+      await handler(event)
+
+      // Verify entry was stored
+      const key = keyForPayload(event.payload)!
+      const entry = cache.get(key)
+      assert.ok(entry)
+      assert.strictEqual(entry!.chunks.length, 1)
+    })
+
+    it("handles /l1-cache clear command", async () => {
+      const mockApi = createMockExtensionAPI()
+      await l1CacheExtension(mockApi)
+
+      const command = mockApi._getCommands().get("l1-cache")
+      const mockCtx = {
+        ui: {
+          notify: () => {},
         },
       }
-      await init(api)
-      const shutdownCbs = events.session_shutdown ?? []
-      shutdown = () => shutdownCbs.forEach((cb) => cb())
+
+      // Populate first so the assertion is meaningful
+      cache.set("k", { chunks: [{ choices: [{ delta: { content: "x" } }] }], timestamp: Date.now(), sizeBytes: 64 })
+
+      await command!.handler("clear", mockCtx)
+
+      assert.strictEqual(cache.size, 0)
     })
 
-    after(() => {
-      shutdown?.()
-    })
+    it("handles /l1-cache stats command", async () => {
+      const mockApi = createMockExtensionAPI()
+      await l1CacheExtension(mockApi)
 
-    beforeEach(() => {
-      Test.reset()
-      Test.setSettings({ enabled: true, maxEntries: 50, maxMemoryBytes: 100000, ttlSeconds: 3600 })
-    })
-
-    const payload = () => ({ messages: [{ role: "user", content: "hello cache" }], parameters: {} })
-    const event = (): any => ({ type: "before_provider_request", payload: payload() })
-    const reqCtx = { model: { id: "test-model" } }
-
-    it("records a miss and stamps _cacheKey on first request", async () => {
-      const ev: any = event()
-      const ret = await events.before_provider_request[0](ev, reqCtx)
-      assert.equal(ret, undefined)
-      assert.ok(ev._cacheKey, "should stamp _cacheKey on miss")
-      assert.equal(Test.getStats().misses, 1)
-    })
-
-    it("returns the cached response on a byte-identical repeat when a body is captured", async () => {
-      const first: any = event()
-      await events.before_provider_request[0](first, reqCtx)
-      // Simulate a pi API that exposes the response body
-      await events.after_provider_response[0]({
-        type: "after_provider_response",
-        status: 200,
-        headers: {},
-        _cacheKey: first._cacheKey,
-        response: { content: "cached!" },
-      } as any)
-
-      const second: any = event()
-      const out = await events.before_provider_request[0](second, reqCtx)
-      assert.ok(out, "identical repeat should short-circuit to cache")
-      assert.equal(out.content, "cached!")
-      assert.equal(Test.getStats().hits, 1)
-    })
-
-    it("never stores an event envelope when no response body is available", async () => {
-      const first: any = event()
-      await events.before_provider_request[0](first, reqCtx)
-      // pi 0.84 + shape: status + headers only, no body
-      await events.after_provider_response[0]({
-        type: "after_provider_response",
-        status: 200,
-        headers: {},
-      } as any)
-      assert.equal(Test._getCacheSize(), 0, "must not cache the event envelope")
-      assert.ok(
-        Test.getStats().misses >= 0,
-        "after_provider_response without a body must not poison the cache",
-      )
-    })
-
-    it("does not touch the cache when disabled", async () => {
-      Test.setSettings({ enabled: false })
-      const ev: any = event()
-      const ret = await events.before_provider_request[0](ev, reqCtx)
-      assert.equal(ret, undefined)
-      assert.equal(ev._cacheKey, undefined)
-      assert.equal(Test.getStats().misses, 0)
-    })
-
-    it("keeps size within cap under interceptor churn", async () => {
-      Test.setSettings({ maxEntries: 20 })
-      for (let i = 0; i < 50; i++) {
-        const ev: any = {
-          type: "before_provider_request",
-          payload: { messages: [{ role: "user", content: `q-${i}` }], parameters: {} },
-        }
-        await events.before_provider_request[0](ev, reqCtx)
-        await events.after_provider_response[0]({
-          _cacheKey: ev._cacheKey,
-          response: { content: "a".repeat(50) },
-        } as any)
+      const command = mockApi._getCommands().get("l1-cache")
+      const mockCtx = {
+        ui: {
+          notify: (msg: string) => {
+            assert.ok(msg.includes("L1 cache"))
+          },
+        },
       }
-      assert.ok(Test._getCacheSize() <= 20)
-      assert.ok(Test.getStats().misses >= 50)
+
+      await command!.handler("stats", mockCtx)
+    })
+  })
+
+  describe("edge cases", () => {
+    it("handles disabled cache", async () => {
+      settings.enabled = false
+
+      const mockApi = createMockExtensionAPI()
+      await l1CacheExtension(mockApi)
+
+      const handler = mockApi._getHandlers("before_provider_request")[0]
+      const event = {
+        payload: { model: "local/deepseek-v4", messages: [{ role: "user", content: "test" }] },
+      }
+
+      const result = await handler(event, { model: { id: "local/deepseek-v4" } })
+      assert.strictEqual(result, undefined)
+    })
+
+    it("handles empty chunks (no storage)", async () => {
+      const mockApi = createMockExtensionAPI()
+      await l1CacheExtension(mockApi)
+
+      const handler = mockApi._getHandlers("provider_stream_complete")[0]
+      const event = {
+        payload: { model: "local/deepseek-v4", messages: [{ role: "user", content: "test" }] },
+        chunks: [], // empty
+      }
+
+      await handler(event)
+      const key = keyForPayload(event.payload)!
+      assert.strictEqual(cache.has(key), false)
+    })
+
+    it("handles stale ctx gracefully", async () => {
+      const mockApi = createMockExtensionAPI()
+      await l1CacheExtension(mockApi)
+
+      const handler = mockApi._getHandlers("before_provider_request")[0]
+      const event = {
+        payload: { model: "local/deepseek-v4", messages: [{ role: "user", content: "test" }] },
+      }
+
+      // Stale ctx (no model.id)
+      const result = await handler(event, { model: { id: undefined } })
+      assert.strictEqual(result, undefined)
+    })
+
+    it("prevents re-storing replays", async () => {
+      const mockApi = createMockExtensionAPI()
+      await l1CacheExtension(mockApi)
+
+      const beforeHandler = mockApi._getHandlers("before_provider_request")[0]
+      const completeHandler = mockApi._getHandlers("provider_stream_complete")[0]
+
+      const payload = { model: "local/deepseek-v4", messages: [{ role: "user", content: "test" }] }
+      const event = { payload }
+
+      // First call is miss
+      await beforeHandler(event, { model: { id: "local/deepseek-v4" } })
+
+      // Simulate cache hit
+      const key = keyForPayload(payload)!
+      cache.set(key, {
+        chunks: [{ choices: [{ delta: { content: "cached" } }] }],
+        timestamp: Date.now(),
+        sizeBytes: 100,
+      })
+
+      // Second call is hit
+      const result = await beforeHandler(event, { model: { id: "local/deepseek-v4" } })
+      assert.ok(result)
+
+      // Try to store (should be prevented by lastServed guard)
+      const chunksBefore = cache.get(key)!.chunks.length
+      await completeHandler({ payload, chunks: [{ choices: [{ delta: { content: "new" } }] }] })
+      const chunksAfter = cache.get(key)!.chunks.length
+
+      assert.strictEqual(chunksBefore, chunksAfter) // should not re-store
+    })
+  })
+
+  describe("performance", () => {
+    it("hash is fast (< 10µs per call)", () => {
+      const iterations = 1000
+      const start = Date.now()
+
+      for (let i = 0; i < iterations; i++) {
+        fastHash("test string " + i)
+      }
+
+      const elapsed = Date.now() - start
+      const avgPerCall = (elapsed * 1000) / iterations // in µs
+      assert.ok(avgPerCall < 10, `Hash average ${avgPerCall}µs, expected < 10µs`)
+    })
+
+    it("coalescing reduces chunk count", () => {
+      const chunks = Array.from({ length: 100 }, (_, i) => ({
+        choices: [{ delta: { content: "x" } }],
+      }))
+
+      const coalesced = coalesceChunks(chunks)
+      assert.strictEqual(coalesced.length, 1) // all merged into one
     })
   })
 })

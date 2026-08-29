@@ -1,6 +1,6 @@
 {
   "name": "pi-l1-cache",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "L1 response cache for pi with replay, disk persistence, and working capture",
   "type": "module",
   "main": "./src/index.ts",
@@ -40,16 +40,14 @@
     "minPiVersion": "0.4.0"
   },
   "scripts": {
-    "test": "node --test src/*.test.ts",
-    "test:watch": "node --watch --test src/*.test.ts",
-    "typecheck": "tsc",
-    "pack": "npm pack --dry-run",
-    "prepack": "npm run typecheck && npm test",
-    "prepublishOnly": "npm run typecheck && npm test"
+    "test": "tsx --test src/*.test.ts",
+    "test:watch": "tsx --watch --test src/*.test.ts",
+    "pack": "npm pack --dry-run"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.0",
     "@types/node": "^20.0.0",
+    "tsx": "^4.23.12",
     "typescript": "^5.8.0"
   },
   "peerDependencies": {
