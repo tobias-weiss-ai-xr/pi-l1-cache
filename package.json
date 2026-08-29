@@ -1,7 +1,7 @@
 {
   "name": "pi-l1-cache",
-  "version": "1.2.2",
-  "description": "L1 in-memory cache extension for pi — CPU/RAM optimized, production-ready",
+  "version": "1.3.0",
+  "description": "L1 response cache for pi with replay, disk persistence, and working capture",
   "type": "module",
   "main": "./src/index.ts",
   "engines": {
@@ -23,7 +23,7 @@
     "README.md",
     "LICENSE"
   ],
-  "author": "Tobias Weiß <info@graphwiz.ai>",
+  "author": "Tobias Wei\u00df <info@graphwiz.ai>",
   "license": "MIT",
   "homepage": "https://github.com/tobias-weiss-ai-xr/pi-l1-cache",
   "repository": {
@@ -34,7 +34,9 @@
     "url": "https://github.com/tobias-weiss-ai-xr/pi-l1-cache/issues"
   },
   "pi": {
-    "extensions": ["./src/index.ts"],
+    "extensions": [
+      "./src/index.ts"
+    ],
     "minPiVersion": "0.4.0"
   },
   "scripts": {
